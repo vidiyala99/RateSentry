@@ -30,18 +30,36 @@ redis.call('EXPIRE', key, 3600)
 return {allowed, math.floor(tokens), math.floor(1 / refill_rate)}
 """
 
+TOKEN_BUCKET_REVERT_SCRIPT = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local requested = tonumber(ARGV[2])
+
+local bucket = redis.call('HMGET', key, 'tokens')
+if bucket[1] then
+    local tokens = tonumber(bucket[1])
+    tokens = math.min(capacity, tokens + requested)
+    redis.call('HMSET', key, 'tokens', tokens)
+end
+return 1
+"""
+
+
 class TokenBucketLimiter:
     def __init__(self, redis_client: aioredis.Redis, capacity: int, refill_rate: float):
         self.redis = redis_client
         self.capacity = capacity
         self.refill_rate = refill_rate
         self._script = self.redis.register_script(TOKEN_BUCKET_SCRIPT)
+        self._revert_script = self.redis.register_script(TOKEN_BUCKET_REVERT_SCRIPT)
 
-    async def is_allowed(self, key: str) -> tuple[bool, int, int]:
+    async def is_allowed(self, key: str):
         now = time.time()
         result = await self._script(
-            keys=[f"tb:{key}"],
-            args=[self.capacity, self.refill_rate, now, 1]
+            keys=[f"tb:{key}"], args=[self.capacity, self.refill_rate, now, 1]
         )
         allowed, remaining, retry_after = result
-        return bool(allowed), int(remaining), int(retry_after)
+        return bool(allowed), int(remaining), int(retry_after), {}
+
+    async def revert(self, key: str, revert_meta: dict):
+        await self._revert_script(keys=[f"tb:{key}"], args=[self.capacity, 1])

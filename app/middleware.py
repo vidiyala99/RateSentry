@@ -6,6 +6,7 @@ from app.limiters.sliding_window import SlidingWindowLimiter
 from app.metrics import REQUESTS_ALLOWED, REQUESTS_DENIED, REQUEST_LATENCY
 import time
 
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, policies):
         super().__init__(app)
@@ -38,6 +39,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if auth.lower().startswith("bearer "):
                 try:
                     from jose import jwt
+
                     payload = jwt.decode(auth[7:], options={"verify_signature": False})
                     return str(payload.get("sub", "anonymous"))
                 except Exception:
@@ -49,13 +51,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         start = time.perf_counter()
 
+        successful_executions = []
+
         for policy in self.policies:
             # Optimized path matching: prefix match for wildcards
             if policy.paths != ["*"]:
                 match = False
                 for p in policy.paths:
                     if p.endswith("*"):
-                        if path.startswith(p[:-1]):
+                        if path.startswith(p[:-1]) or path == p[:-2]:
                             match = True
                             break
                     elif path == p:
@@ -63,7 +67,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                         break
                 if not match:
                     continue
-            
+
             limiter = self.limiters.get(policy.name)
             if not limiter:
                 continue
@@ -74,8 +78,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             result = await limiter.is_allowed(identifier)
             allowed = result[0]
             remaining = result[1]
+            revert_meta = result[-1] if isinstance(result[-1], dict) else {}
 
             if not allowed:
+                # Revert previous limit deductions since request failed
+                for prev_limiter, prev_id, prev_meta in successful_executions:
+                    await prev_limiter.revert(prev_id, prev_meta)
+
                 REQUESTS_DENIED.labels(policy=policy.name).inc()
                 return JSONResponse(
                     status_code=429,
@@ -83,13 +92,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     headers={
                         "X-RateLimit-Limit": str(policy.limit),
                         "X-RateLimit-Remaining": "0",
-                        "Retry-After": str(result[2] if len(result) > 2 else 60),
-                    }
+                        "Retry-After": str(
+                            result[2]
+                            if len(result) > 2 and not isinstance(result[2], dict)
+                            else 60
+                        ),
+                    },
                 )
 
+            successful_executions.append((limiter, identifier, revert_meta))
             REQUESTS_ALLOWED.labels(policy=policy.name).inc()
 
         response = await call_next(request)
         latency = time.perf_counter() - start
-        REQUEST_LATENCY.labels(method=request.method, path=request.url.path).observe(latency)
+        REQUEST_LATENCY.labels(method=request.method, path=request.url.path).observe(
+            latency
+        )
         return response
